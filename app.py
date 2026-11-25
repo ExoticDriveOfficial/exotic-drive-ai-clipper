@@ -84,22 +84,73 @@ def make_watermark(path, w=900, h=160):
     d.text((x,y), text, font=font, fill=(255,255,255,210), stroke_width=2, stroke_fill=(0,0,0,180))
     img.save(path)
 
+
 def cut_clip(src, dst, start, length, vertical, wm):
-    args = ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", str(src), "-t", f"{length:.2f}"]
+    args = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", str(src),
+        "-t", f"{length:.2f}"
+    ]
+
     if vertical:
-        vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        vf = (
+            "scale=1080:1920:"
+            "force_original_aspect_ratio=increase,"
+            "crop=1080:1920"
+        )
     else:
-        vf = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        vf = (
+            "scale=1920:1080:"
+            "force_original_aspect_ratio=decrease,"
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        )
+
     if wm:
         wm_path = str(Path(dst).with_suffix(".png"))
         make_watermark(wm_path)
+
         args += ["-i", wm_path]
-        vf += " [base];[1:v]scale=iw:ih[wm];[base][wm]overlay=0:0"
-        args += ["-filter_complex", vf]
+
+        args += [
+            "-filter_complex",
+            f"[0:v]{vf}[base];"
+            "[1:v]format=rgba[logo];"
+            "[base][logo]overlay="
+            "W-w-30:H-h-30:format=auto[vout]",
+            "-map", "[vout]",
+            "-map", "0:a?"
+        ]
     else:
-        args += ["-vf", vf]
-    args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dst)]
-    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        args += [
+            "-vf", vf,
+            "-map", "0:v:0",
+            "-map", "0:a?"
+        ]
+
+    args += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-movflags", "+faststart",
+        str(dst)
+    ]
+
+    subprocess.run(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=True
+    )
+
+    if wm:
+        try:
+            os.remove(wm_path)
+        except OSError:
+            pass
 
 if not ffmpeg_path() or not shutil.which("ffprobe"):
     st.error("FFmpeg belum terpasang / belum masuk PATH. Ikuti petunjuk instalasi di README.txt, lalu jalankan ulang dashboard.")
