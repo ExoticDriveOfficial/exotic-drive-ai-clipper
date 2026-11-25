@@ -152,6 +152,34 @@ def cut_clip(src, dst, start, length, vertical, wm):
         except OSError:
             pass
 
+def merge_clips(clip_paths, output_path):
+    list_file = Path(output_path).with_name("concat_list.txt")
+
+    with open(list_file, "w", encoding="utf-8") as f:
+        for clip in clip_paths:
+            path = Path(clip).resolve().as_posix()
+            path = path.replace("'", "'\\''")
+            f.write(f"file '{path}'\n")
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(list_file),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(output_path)
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True
+        )
+    finally:
+        if list_file.exists():
+            list_file.unlink()
+
 if not ffmpeg_path() or not shutil.which("ffprobe"):
     st.error("FFmpeg belum terpasang / belum masuk PATH. Ikuti petunjuk instalasi di README.txt, lalu jalankan ulang dashboard.")
     st.stop()
@@ -211,6 +239,35 @@ if st.session_state.get("results"):
                     st.download_button(f"⬇️ Download {p.name}", p.read_bytes(), file_name=p.name, mime="video/mp4", key=f"dl_{vi}_{p.name}")
                 st.info("Caption contoh: Full throttle, no fear! 🏁🔥 #ExoticDrive #TrophyTruck #OffRoadRacing #DesertRacing")
                 st.caption("Periksa hasil sebelum upload. Tool ini menyiapkan file; upload ke Facebook/Instagram/TikTok dilakukan oleh Anda.")
+if made:
+    st.divider()
+    st.subheader("🎬 EXOTIC DRIVE VIDEO COMPILATION")
+
+    if st.button(
+        "🎞️ GABUNGKAN SEMUA CLIP",
+        key=f"merge_{vi}",
+        use_container_width=True
+    ):
+        output = folder / "EXOTIC_DRIVE_COMPILATION.mp4"
+
+        try:
+            with st.spinner("Menggabungkan semua video..."):
+                merge_clips(made, output)
+
+            st.success("Video berhasil digabungkan!")
+            st.video(str(output))
+
+            st.download_button(
+                "⬇️ DOWNLOAD VIDEO GABUNGAN",
+                output.read_bytes(),
+                file_name=output.name,
+                mime="video/mp4",
+                key=f"merge_dl_{vi}"
+            )
+
+        except Exception as e:
+            st.error(f"Gagal menggabungkan video: {e}")
+
 else:
     st.info("Mulai dengan mengunggah video, lalu tekan ANALISIS & CARI HOOK.")
 st.divider()
