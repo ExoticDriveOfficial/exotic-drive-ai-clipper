@@ -111,6 +111,7 @@ def get_folder(service):
 # CREATE RESUMABLE UPLOAD SESSION
 # =====================================================
 
+
 def create_upload_session(
     creds,
     folder_id,
@@ -133,7 +134,8 @@ def create_upload_session(
     headers = {
         "Authorization": "Bearer " + creds.token,
         "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": mime_type
+        "X-Upload-Content-Type": mime_type,
+        "Origin": "https://exotic-drive-official.streamlit.app"
     }
 
     response = requests.post(
