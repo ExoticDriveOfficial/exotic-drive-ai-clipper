@@ -1,6 +1,11 @@
-[server]
-maxUploadSize = 500
-headless = true
 
-[browser]
-gatherUsageStats = false
+[server]
+maxUploadSize = 2048
+maxMessageSize = 2048
+
+[theme]
+base = "dark"
+primaryColor = "#e63946"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1b1f27"
+textColor = "#ffffff"
