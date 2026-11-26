@@ -1,996 +1,1065 @@
 
-import streamlit as st
-import cv2
-import numpy as np
-import subprocess
-import shutil
-import tempfile
 import os
-import re
+import json
 import math
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+import shutil
+import subprocess
+import tempfile
+import requests
+import streamlit as st
 
-# ==========================================
-# EXOTIC DRIVE AI STUDIO
-# VERSION 1.0
-# ==========================================
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import streamlit.components.v1 as components
+
+
+# =====================================================
+# EXOTIC DRIVE AI 2.0
+# Direct Google Drive Resumable Upload
+# =====================================================
 
 st.set_page_config(
-    page_title="EXOTIC DRIVE AI STUDIO",
+    page_title="EXOTIC DRIVE AI",
     page_icon="🏁",
     layout="wide"
 )
 
-st.markdown("""
-<style>
-.stApp {
-    background-color: #101116;
-}
-h1, h2, h3 {
-    color: white;
-}
-.stButton button {
-    border-radius: 8px;
-    font-weight: bold;
-}
-</style>
-""", unsafe_allow_html=True)
+BASE = Path(__file__).parent
+WORK = BASE / "work"
+OUT = BASE / "outputs"
 
-st.title("🏁 EXOTIC DRIVE AI STUDIO")
-st.caption("AI AUTO CUT • VIDEO EDITOR • TIMELINE • EXPORT HD")
-
-# ==========================================
-# SESSION STORAGE
-# ==========================================
-
-if "workdir" not in st.session_state:
-    st.session_state.workdir = tempfile.mkdtemp(
-        prefix="exotic_drive_"
-    )
-
-if "results" not in st.session_state:
-    st.session_state.results = []
-
-WORK = Path(st.session_state.workdir)
 WORK.mkdir(exist_ok=True)
+OUT.mkdir(exist_ok=True)
 
-# ==========================================
-# SIDEBAR
-# ==========================================
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-with st.sidebar:
-    st.header("⚙️ PENGATURAN")
+FOLDER_NAME = "EXOTIC DRIVE AI UPLOADS"
 
-    clip_len = st.slider(
-        "Durasi setiap clip",
-        10, 60, 25, 5
+
+# =====================================================
+# GOOGLE DRIVE CONNECTION
+# =====================================================
+
+@st.cache_resource
+def get_drive():
+
+    if "google_drive" not in st.secrets:
+        raise RuntimeError("Google Drive Secrets belum diatur.")
+
+    raw = st.secrets["google_drive"]["token_json"]
+
+    info = json.loads(raw)
+
+    creds = Credentials.from_authorized_user_info(
+        info,
+        scopes=SCOPES
     )
 
-    number_clips = st.slider(
-        "Jumlah highlight",
-        1, 8, 3
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    if not creds.valid:
+        raise RuntimeError(
+            "Token Google Drive tidak valid. Periksa OAuth."
+        )
+
+    service = build(
+        "drive",
+        "v3",
+        credentials=creds,
+        cache_discovery=False
     )
 
-    aspect = st.selectbox(
-        "Format video",
-        [
-            "9:16 Reels / Shorts / TikTok",
-            "16:9 Landscape"
-        ]
+    return service, creds
+
+
+def get_folder(service):
+
+    query = (
+        "name='" + FOLDER_NAME + "' "
+        "and mimeType='application/vnd.google-apps.folder' "
+        "and trashed=false"
     )
 
-    resolution = st.selectbox(
-        "Resolusi export",
-        ["1080p Full HD", "720p HD"]
+    result = service.files().list(
+        q=query,
+        fields="files(id,name)",
+        pageSize=20
+    ).execute()
+
+    folders = result.get("files", [])
+
+    if folders:
+        return folders[0]["id"]
+
+    folder = service.files().create(
+        body={
+            "name": FOLDER_NAME,
+            "mimeType": "application/vnd.google-apps.folder"
+        },
+        fields="id,name"
+    ).execute()
+
+    return folder["id"]
+
+
+# =====================================================
+# CREATE RESUMABLE UPLOAD SESSION
+# =====================================================
+
+def create_upload_session(
+    creds,
+    folder_id,
+    filename,
+    mime_type
+):
+
+    url = (
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=resumable"
+        "&fields=id,name,size,mimeType,webViewLink"
     )
 
-    watermark = st.checkbox(
-        "Watermark EXOTIC DRIVE",
-        value=True
+    metadata = {
+        "name": Path(filename).name,
+        "mimeType": mime_type,
+        "parents": [folder_id]
+    }
+
+    headers = {
+        "Authorization": "Bearer " + creds.token,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": mime_type
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=metadata,
+        timeout=60
     )
 
-    st.divider()
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            "Gagal membuat sesi upload: "
+            + response.text[:1000]
+        )
 
-    st.caption("EXOTIC DRIVE AI")
-    st.caption("Free Edition • No paid API")
+    upload_url = response.headers.get("Location")
 
-# ==========================================
-# FFMPEG
-# ==========================================
+    if not upload_url:
+        raise RuntimeError(
+            "Google tidak memberikan alamat upload."
+        )
 
-def ffmpeg_path():
-    return shutil.which("ffmpeg")
+    return upload_url
 
-def ffprobe_path():
-    return shutil.which("ffprobe")
+
+# =====================================================
+# BROWSER DIRECT UPLOAD
+# =====================================================
+
+def upload_widget(upload_url):
+
+    safe_url = json.dumps(upload_url)
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+    body {
+        font-family: Arial, sans-serif;
+        background: transparent;
+        color: inherit;
+    }
+
+    .panel {
+        border: 1px solid #777;
+        border-radius: 12px;
+        padding: 16px;
+    }
+
+    button {
+        background: #16834a;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 12px 20px;
+        margin-top: 12px;
+        cursor: pointer;
+        font-weight: bold;
+    }
+
+    progress {
+        width: 100%;
+        height: 18px;
+        margin-top: 15px;
+    }
+
+    #status {
+        margin-top: 12px;
+        font-size: 14px;
+        overflow-wrap: anywhere;
+    }
+    </style>
+    </head>
+
+    <body>
+
+    <div class="panel">
+
+        <h3>🏁 EXOTIC DRIVE VIDEO UPLOAD</h3>
+
+        <p>
+        Pilih video dari HP atau komputer.
+        Video akan dikirim langsung ke Google Drive
+        secara bertahap.
+        </p>
+
+        <input
+            type="file"
+            id="file"
+            accept="video/mp4,video/quicktime,video/x-m4v,video/x-matroska"
+        />
+
+        <br>
+
+        <button id="upload">
+            MULAI UPLOAD
+        </button>
+
+        <progress
+            id="progress"
+            value="0"
+            max="100"
+        ></progress>
+
+        <div id="status">
+            Menunggu video...
+        </div>
+
+    </div>
+
+    <script>
+
+    const uploadURL = """ + safe_url + """;
+
+    const input = document.getElementById("file");
+    const button = document.getElementById("upload");
+    const progress = document.getElementById("progress");
+    const status = document.getElementById("status");
+
+    const CHUNK = 8 * 1024 * 1024;
+
+    button.onclick = async function() {
+
+        const file = input.files[0];
+
+        if (!file) {
+            status.innerText = "Pilih video terlebih dahulu.";
+            return;
+        }
+
+        if (!file.type.startsWith("video/")) {
+            status.innerText = "File harus berupa video.";
+            return;
+        }
+
+        button.disabled = true;
+
+        let start = 0;
+
+        try {
+
+            while (start < file.size) {
+
+                const end = Math.min(
+                    start + CHUNK,
+                    file.size
+                );
+
+                const chunk = file.slice(start, end);
+
+                status.innerText =
+                    "Mengunggah " +
+                    (start / 1024 / 1024).toFixed(1) +
+                    " MB dari " +
+                    (file.size / 1024 / 1024).toFixed(1) +
+                    " MB";
+
+                const response = await fetch(
+                    uploadURL,
+                    {
+                        method: "PUT",
+
+                        headers: {
+                            "Content-Type": file.type,
+                            "Content-Range":
+                                "bytes " +
+                                start +
+                                "-" +
+                                (end - 1) +
+                                "/" +
+                                file.size
+                        },
+
+                        body: chunk
+                    }
+                );
+
+                if (
+                    response.status === 200 ||
+                    response.status === 201
+                ) {
+
+                    const data = await response.json();
+
+                    progress.value = 100;
+
+                    status.innerText =
+                        "UPLOAD BERHASIL! " +
+                        data.name +
+                        " | ID: " +
+                        data.id;
+
+                    button.disabled = false;
+                    return;
+                }
+
+                if (response.status !== 308) {
+
+                    const errorText =
+                        await response.text();
+
+                    throw new Error(
+                        "Google Drive: " +
+                        response.status +
+                        " " +
+                        errorText
+                    );
+                }
+
+                start = end;
+
+                progress.value =
+                    (start / file.size) * 100;
+            }
+
+        } catch (error) {
+
+            status.innerText =
+                "UPLOAD GAGAL: " + error.message;
+
+        }
+
+        button.disabled = false;
+    };
+
+    </script>
+
+    </body>
+    </html>
+    """
+
+    components.html(
+        html,
+        height=310,
+        scrolling=True
+    )
+
+
+# =====================================================
+# GOOGLE DRIVE FILE LIST
+# =====================================================
+
+def list_videos(service, folder_id):
+
+    result = service.files().list(
+        q=(
+            "'" + folder_id + "' in parents "
+            "and trashed=false"
+        ),
+        fields="files(id,name,size,mimeType,createdTime)",
+        pageSize=100,
+        orderBy="createdTime desc"
+    ).execute()
+
+    return [
+        f for f in result.get("files", [])
+        if f.get("mimeType", "").startswith("video/")
+    ]
+
+
+# =====================================================
+# DOWNLOAD FROM GOOGLE DRIVE TO SERVER DISK
+# =====================================================
+
+def download_drive_file(service, file_id, destination):
+
+    request = service.files().get_media(
+        fileId=file_id
+    )
+
+    with open(destination, "wb") as file:
+
+        downloader = MediaIoBaseDownload(
+            file,
+            request,
+            chunksize=8 * 1024 * 1024
+        )
+
+        done = False
+
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+# =====================================================
+# VIDEO TOOLS
+# =====================================================
+
+def run_command(cmd):
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr[-2000:]
+        )
+
+    return result.stdout.strip()
+
 
 def probe_duration(path):
+
+    value = run_command([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ])
+
+    return float(value)
+
+
+# =====================================================
+# FREE LOCAL HIGHLIGHT ANALYSIS
+# =====================================================
+
+def analyze_video(video, duration, clip_seconds=20):
+
+    temp = Path(
+        tempfile.mkdtemp(dir=WORK)
+    )
+
     try:
-        cmd = [
-            ffprobe_path(),
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path)
+
+        run_command([
+            "ffmpeg",
+            "-y",
+            "-i", str(video),
+            "-vf",
+            "fps=1,scale=320:180",
+            "-q:v", "5",
+            str(temp / "frame_%06d.jpg")
+        ])
+
+        files = sorted(
+            temp.glob("frame_*.jpg")
+        )
+
+        if len(files) < 2:
+            raise RuntimeError(
+                "Frame video tidak dapat dibaca."
+            )
+
+        scores = []
+        previous = None
+
+        for frame in files:
+
+            image = Image.open(frame).convert("L")
+
+            if previous is None:
+                score = 0
+            else:
+                difference = ImageChops.difference(
+                    previous,
+                    image
+                )
+
+                score = (
+                    sum(ImageStat.Stat(difference).mean)
+                    / 255
+                )
+
+            scores.append(score)
+            previous = image
+
+        length = max(
+            5,
+            min(
+                int(clip_seconds),
+                int(math.ceil(duration))
+            )
+        )
+
+        candidates = []
+
+        max_start = max(
+            0,
+            int(duration) - length
+        )
+
+        for start in range(
+            0,
+            max_start + 1,
+            max(1, length // 4)
+        ):
+
+            end = min(
+                len(scores),
+                start + length
+            )
+
+            values = scores[
+                max(1, start + 1):end
+            ]
+
+            if not values:
+                continue
+
+            average = sum(values) / len(values)
+            peak = max(values)
+
+            total = (
+                0.75 * average
+                + 0.25 * peak
+            )
+
+            candidates.append((
+                total,
+                start,
+                min(duration, start + length)
+            ))
+
+        candidates.sort(reverse=True)
+
+        selected = []
+
+        for score, start, end in candidates:
+
+            if all(
+                end <= item[1]
+                or start >= item[2]
+                for item in selected
+            ):
+
+                selected.append((
+                    score,
+                    start,
+                    end
+                ))
+
+            if len(selected) >= 3:
+                break
+
+        selected.sort(key=lambda item: item[1])
+
+        return [
+            {
+                "start": float(start),
+                "end": float(end),
+                "score": max(
+                    1,
+                    min(99, round(score * 100))
+                ),
+                "reason": (
+                    "Perubahan visual relatif tinggi. "
+                    "Periksa apakah adegan benar-benar "
+                    "menampilkan aksi Trophy Truck."
+                )
+            }
+            for score, start, end in selected
         ]
 
-        return float(
-            subprocess.check_output(
-                cmd,
-                stderr=subprocess.STDOUT
-            ).decode().strip()
+    finally:
+        shutil.rmtree(
+            temp,
+            ignore_errors=True
         )
-    except Exception:
-        return 0.0
 
-# ==========================================
+
+# =====================================================
 # WATERMARK
-# ==========================================
+# =====================================================
 
-def make_watermark(path):
-    img = Image.new(
+def create_watermark(path):
+
+    image = Image.new(
         "RGBA",
-        (520, 100),
+        (900, 110),
         (0, 0, 0, 0)
     )
 
-    draw = ImageDraw.Draw(img)
+    draw = ImageDraw.Draw(image)
 
     try:
         font = ImageFont.truetype(
-            "DejaVuSans-Bold.ttf", 42
+            "DejaVuSans-Bold.ttf",
+            48
         )
     except Exception:
         font = ImageFont.load_default()
 
     draw.text(
-        (15, 20),
+        (18, 15),
         "EXOTIC DRIVE",
         font=font,
-        fill=(255, 255, 255, 220),
+        fill=(255, 255, 255, 225),
         stroke_width=2,
         stroke_fill=(0, 0, 0, 180)
     )
 
-    img.save(path)
+    image.save(path)
 
-# ==========================================
-# VIDEO ANALYSIS
-# ==========================================
 
-def normalize(arr):
-    p95 = np.percentile(arr, 95)
+# =====================================================
+# RENDER VERTICAL REELS
+# =====================================================
 
-    if p95 <= 0.000001:
-        return np.zeros_like(arr)
+def render_reel(
+    source,
+    start,
+    end,
+    destination,
+    watermark=True
+):
 
-    return np.clip(arr / p95, 0, 1)
-
-def analyze_video(path):
-    cap = cv2.VideoCapture(str(path))
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-    duration = total / fps if fps else 0
-
-    if duration <= 0:
-        cap.release()
-        return [], 0
-
-    samples = []
-    previous = None
-
-    step = max(1, int(fps / 2))
-    idx = 0
-
-    while True:
-        ok, frame = cap.read()
-
-        if not ok:
-            break
-
-        if idx % step == 0:
-            small = cv2.resize(
-                frame, (160, 90)
-            )
-
-            gray = cv2.cvtColor(
-                small, cv2.COLOR_BGR2GRAY
-            )
-
-            motion = (
-                0 if previous is None
-                else float(
-                    np.mean(
-                        cv2.absdiff(gray, previous)
-                    )
-                )
-            )
-
-            hsv = cv2.cvtColor(
-                small, cv2.COLOR_BGR2HSV
-            )
-
-            hist = cv2.calcHist(
-                [hsv],
-                [0, 1],
-                None,
-                [16, 16],
-                [0, 180, 0, 256]
-            )
-
-            cv2.normalize(hist, hist)
-
-            scene = (
-                0 if not samples
-                else float(
-                    cv2.compareHist(
-                        hist,
-                        samples[-1]["hist"],
-                        cv2.HISTCMP_BHATTACHARYYA
-                    )
-                )
-            )
-
-            samples.append({
-                "t": idx / fps,
-                "motion": motion,
-                "scene": scene,
-                "hist": hist
-            })
-
-            previous = gray
-
-        idx += 1
-
-    cap.release()
-
-    if not samples:
-        return [], duration
-
-    times = np.array(
-        [x["t"] for x in samples]
-    )
-
-    motion = normalize(
-        np.array([x["motion"] for x in samples])
-    )
-
-    scene = normalize(
-        np.array([x["scene"] for x in samples])
-    )
-
-    score = (
-        0.78 * motion +
-        0.22 * scene
-    )
-
-    results = []
-
-    half = 2.5
-
-    for i, t in enumerate(times):
-        mask = (
-            (times >= t - half) &
-            (times <= t + half)
-        )
-
-        value = (
-            float(np.mean(score[mask]))
-            if np.any(mask)
-            else float(score[i])
-        )
-
-        results.append((float(t), value))
-
-    return results, duration
-
-# ==========================================
-# AUTO CUT ENGINE
-# ==========================================
-
-def cut_clip(src, dst, start, length, vertical, wm):
-    if vertical:
-        vf = (
-            "scale=1080:1920:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1080:1920"
-        )
-    else:
-        vf = (
-            "scale=1920:1080:"
-            "force_original_aspect_ratio=decrease,"
-            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
-        )
-
-    args = [
-        ffmpeg_path(), "-y",
+    command = [
+        "ffmpeg",
+        "-y",
         "-ss", str(start),
-        "-i", str(src),
-        "-t", str(length)
+        "-i", str(source),
+        "-t", str(max(1, end - start))
     ]
 
-    wm_path = None
+    if watermark:
 
-    if wm:
-        wm_path = str(
-            Path(dst).with_suffix(".png")
-        )
+        watermark_path = WORK / "watermark.png"
 
-        make_watermark(wm_path)
+        create_watermark(watermark_path)
 
-        args += ["-i", wm_path]
-
-        args += [
+        command += [
+            "-i", str(watermark_path),
             "-filter_complex",
-            f"[0:v]{vf}[base];"
-            "[1:v]format=rgba[logo];"
-            "[base][logo]overlay="
-            "W-w-30:H-h-30[vout]",
+            (
+                "[0:v]scale=1080:1920:"
+                "force_original_aspect_ratio=increase,"
+                "crop=1080:1920,setsar=1[v];"
+                "[v][1:v]overlay=40:40[vout]"
+            ),
             "-map", "[vout]",
             "-map", "0:a?"
         ]
 
     else:
-        args += [
-            "-vf", vf,
-            "-map", "0:v:0",
-            "-map", "0:a?"
+
+        command += [
+            "-vf",
+            (
+                "scale=1080:1920:"
+                "force_original_aspect_ratio=increase,"
+                "crop=1080:1920,setsar=1"
+            )
         ]
 
-    args += [
+    command += [
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
+        "-crf", "21",
         "-c:a", "aac",
         "-b:a", "160k",
+        "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        str(dst)
+        str(destination)
     ]
 
-    subprocess.run(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True
-    )
+    run_command(command)
 
-    if wm_path and os.path.exists(wm_path):
-        os.remove(wm_path)
 
-# ==========================================
-# MERGE VIDEO
-# ==========================================
+# =====================================================
+# MAIN DASHBOARD
+# =====================================================
 
-def merge_clips(clips, output):
-    list_file = Path(output).with_name(
-        "concat_list.txt"
-    )
+st.title("🏁 EXOTIC DRIVE AI")
 
-    with open(
-        list_file, "w", encoding="utf-8"
-    ) as f:
-
-        for clip in clips:
-            path = Path(clip).resolve().as_posix()
-            path = path.replace("'", "'\\''")
-
-            f.write(f"file '{path}'\n")
-
-    try:
-        subprocess.run(
-            [
-                ffmpeg_path(), "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(list_file),
-                "-c", "copy",
-                "-movflags", "+faststart",
-                str(output)
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=True
-        )
-    finally:
-        if list_file.exists():
-            list_file.unlink()
-
-# ==========================================
-# TEXT OVERLAY
-# ==========================================
-
-def make_text_image(text, path, vertical):
-    w, h = (
-        (1080, 1920)
-        if vertical
-        else (1920, 1080)
-    )
-
-    img = Image.new(
-        "RGBA", (w, h), (0, 0, 0, 0)
-    )
-
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font = ImageFont.truetype(
-            "DejaVuSans-Bold.ttf", 54
-        )
-    except Exception:
-        font = ImageFont.load_default()
-
-    draw.text(
-        (w // 2, int(h * 0.14)),
-        text,
-        font=font,
-        fill=(255, 255, 255, 255),
-        anchor="mm",
-        stroke_width=3,
-        stroke_fill=(0, 0, 0, 220)
-    )
-
-    img.save(path)
-
-# ==========================================
-# FINAL RENDER
-# ==========================================
-
-def final_render(
-    base,
-    output,
-    music=None,
-    music_volume=0.5,
-    text_overlay="",
-    vertical=True
-):
-    args = [
-        ffmpeg_path(), "-y",
-        "-i", str(base)
-    ]
-
-    music_index = None
-    text_index = None
-    temp_text = None
-
-    if music:
-        music_index = 1
-
-        args += [
-            "-stream_loop", "-1",
-            "-i", str(music)
-        ]
-
-    if text_overlay.strip():
-        temp_text = WORK / "text_overlay.png"
-
-        make_text_image(
-            text_overlay,
-            temp_text,
-            vertical
-        )
-
-        text_index = len(
-            [x for x in [music_index] if x is not None]
-        ) + 1
-
-        args += ["-i", str(temp_text)]
-
-    if text_index is not None:
-        args += [
-            "-filter_complex",
-            f"[0:v][{text_index}:v]"
-            "overlay=0:0[vout]",
-            "-map", "[vout]"
-        ]
-    else:
-        args += ["-map", "0:v:0"]
-
-    if music_index is not None:
-        args += [
-            "-map", f"{music_index}:a:0",
-            "-af", f"volume={music_volume}",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-shortest"
-        ]
-    else:
-        args += [
-            "-map", "0:a?",
-            "-c:a", "copy"
-        ]
-
-    if text_index is not None:
-        args += [
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p"
-        ]
-    else:
-        args += ["-c:v", "copy"]
-
-    args += [
-        "-movflags", "+faststart",
-        str(output)
-    ]
-
-    subprocess.run(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True
-    )
-
-    if temp_text and temp_text.exists():
-        temp_text.unlink()
-
-# ==========================================
-# CHECK FFMPEG
-# ==========================================
-
-if not ffmpeg_path() or not ffprobe_path():
-    st.error(
-        "FFmpeg atau FFprobe belum tersedia. "
-        "Periksa instalasi FFmpeg."
-    )
-    st.stop()
-
-# ==========================================
-# UPLOAD VIDEO
-# ==========================================
-
-st.header("📁 1. UPLOAD VIDEO")
-
-uploads = st.file_uploader(
-    "Pilih video untuk diedit",
-    type=["mp4", "mov", "mkv", "avi", "webm"],
-    accept_multiple_files=True
+st.caption(
+    "Direct Google Drive Upload • Free Auto Cut "
+    "• Hook Finder • Reels 9:16"
 )
 
-col1, col2 = st.columns(2)
+try:
 
-with col1:
-    analyze_button = st.button(
-        "🔎 ANALISIS & CARI HIGHLIGHT",
-        type="primary",
-        use_container_width=True
+    service, credentials = get_drive()
+    folder_id = get_folder(service)
+
+    st.success(
+        "Google Drive berhasil terhubung."
     )
 
-with col2:
-    if st.button(
-        "🗑️ RESET PROJECT",
-        use_container_width=True
-    ):
-        st.session_state.results = []
+except Exception as error:
 
-        for key in list(st.session_state.keys()):
-            if key.startswith(("made_", "final_")):
-                del st.session_state[key]
+    st.error(
+        "Koneksi Google Drive gagal: "
+        + str(error)
+    )
 
-        st.rerun()
+    st.stop()
 
-if analyze_button:
-    if not uploads:
-        st.warning("Silakan upload video terlebih dahulu.")
+
+# =====================================================
+# SIDEBAR
+# =====================================================
+
+with st.sidebar:
+
+    st.header("⚙️ Pengaturan")
+
+    clip_seconds = st.slider(
+        "Durasi Reels",
+        10,
+        30,
+        20
+    )
+
+    add_watermark = st.checkbox(
+        "Watermark EXOTIC DRIVE",
+        value=True
+    )
+
+    st.info(
+        "Mode gratis menggunakan analisis "
+        "perubahan visual, bukan prediksi viral."
+    )
+
+
+# =====================================================
+# UPLOAD SECTION
+# =====================================================
+
+st.subheader("1. Upload Video Besar")
+
+st.write(
+    "Pilih nama video terlebih dahulu. "
+    "Setelah itu gunakan pemilih file di bawah."
+)
+
+filename = st.text_input(
+    "Nama file video",
+    placeholder="contoh: trophy_truck_race.mp4"
+)
+
+if st.button(
+    "Buat Sesi Upload",
+    type="primary",
+    use_container_width=True
+):
+
+    if not filename.strip():
+
+        st.error("Masukkan nama file.")
 
     else:
-        st.session_state.results = []
 
-        progress = st.progress(0)
+        try:
 
-        for n, up in enumerate(uploads):
-            safe_name = re.sub(
-                r"[^a-zA-Z0-9_-]",
-                "_",
-                Path(up.name).stem
+            upload_url = create_upload_session(
+                credentials,
+                folder_id,
+                filename,
+                "video/mp4"
             )
 
-            src = WORK / (
-                f"source_{n}_{safe_name}"
-                f"{Path(up.name).suffix.lower()}"
+            st.session_state["upload_url"] = upload_url
+
+            st.success(
+                "Sesi upload berhasil dibuat. "
+                "Pilih video dengan nama yang sama."
             )
 
-            src.write_bytes(up.getbuffer())
+        except Exception as error:
 
-            with st.spinner(
-                f"Menganalisis {up.name}..."
-            ):
-                scores, duration = analyze_video(src)
+            st.error(str(error))
 
-            if not scores:
-                st.warning(
-                    f"Tidak dapat membaca {up.name}"
-                )
-                continue
 
-            length = min(
-                float(clip_len),
-                float(duration)
-            )
+if st.session_state.get("upload_url"):
 
-            candidates = sorted(
-                scores,
-                key=lambda x: x[1],
-                reverse=True
-            )
-
-            chosen = []
-
-            for t, score in candidates:
-                start = max(
-                    0,
-                    min(
-                        t - length / 2,
-                        duration - length
-                    )
-                )
-
-                end = start + length
-
-                if all(
-                    end <= a or start >= b
-                    for a, b, _ in chosen
-                ):
-                    chosen.append(
-                        (start, end, score)
-                    )
-
-                if len(chosen) >= number_clips:
-                    break
-
-            chosen.sort()
-
-            st.session_state.results.append({
-                "name": up.name,
-                "src": str(src),
-                "clips": chosen,
-                "duration": duration
-            })
-
-            progress.progress(
-                (n + 1) / len(uploads)
-            )
-
-        st.success("Analisis selesai!")
-
-# ==========================================
-# RESULTS
-# ==========================================
-
-if st.session_state.results:
-
-    st.divider()
-    st.header("🎯 2. HASIL AI HIGHLIGHT")
-
-    for vi, item in enumerate(
-        st.session_state.results
-    ):
-
-        with st.expander(
-            f"🏁 {item['name']}",
-            expanded=True
-        ):
-
-            st.write(
-                f"Durasi sumber: "
-                f"{item['duration']:.1f} detik"
-            )
-
-            for ci, (start, end, score) in enumerate(
-                item["clips"], 1
-            ):
-                st.write(
-                    f"**Highlight {ci}** — "
-                    f"{start:.1f}s sampai {end:.1f}s "
-                    f"— Skor visual {score*100:.0f}/100"
-                )
-
-            clip_key = f"made_{vi}"
-
-            if st.button(
-                "✂️ BUAT SEMUA CLIP",
-                key=f"create_{vi}",
-                type="primary",
-                use_container_width=True
-            ):
-
-                folder = WORK / f"clips_{vi}"
-                folder.mkdir(exist_ok=True)
-
-                made = []
-
-                vertical = aspect.startswith("9:16")
-
-                bar = st.progress(0)
-
-                for ci, (start, end, score) in enumerate(
-                    item["clips"], 1
-                ):
-
-                    dst = folder / (
-                        f"ExoticDrive_Hook_{ci}.mp4"
-                    )
-
-                    try:
-                        cut_clip(
-                            item["src"],
-                            dst,
-                            start,
-                            end - start,
-                            vertical,
-                            watermark
-                        )
-
-                        made.append(str(dst))
-
-                    except Exception as e:
-                        st.error(
-                            f"Gagal membuat clip {ci}: {e}"
-                        )
-
-                    bar.progress(
-                        ci / len(item["clips"])
-                    )
-
-                st.session_state[clip_key] = made
-
-                st.success(
-                    f"{len(made)} clip berhasil dibuat."
-                )
-
-            made = st.session_state.get(
-                clip_key, []
-            )
-
-            if made:
-
-                st.divider()
-                st.header("🎬 3. VIDEO TIMELINE EDITOR")
-
-                edited = []
-
-                for ci, clip_path in enumerate(made):
-                    duration = probe_duration(clip_path)
-
-                    if duration <= 0:
-                        continue
-
-                    st.markdown(
-                        f"### 🎞️ VIDEO TRACK {ci+1}"
-                    )
-
-                    st.video(clip_path)
-
-                    start_trim, end_trim = st.slider(
-                        f"Potong durasi klip {ci+1}",
-                        min_value=0.0,
-                        max_value=float(duration),
-                        value=(0.0, float(duration)),
-                        step=0.1,
-                        key=f"trim_{vi}_{ci}"
-                    )
-
-                    order = st.number_input(
-                        f"Urutan klip {ci+1}",
-                        min_value=1,
-                        max_value=len(made),
-                        value=ci+1,
-                        step=1,
-                        key=f"order_{vi}_{ci}"
-                    )
-
-                    edited.append({
-                        "path": clip_path,
-                        "start": start_trim,
-                        "end": end_trim,
-                        "order": int(order)
-                    })
-
-                    st.caption(
-                        f"Durasi edit: "
-                        f"{end_trim-start_trim:.1f} detik"
-                    )
-
-                st.divider()
-
-                st.header("🎵 4. MUSIK DAN TEKS")
-
-                music_upload = st.file_uploader(
-                    "Upload musik MP3 / WAV (opsional)",
-                    type=["mp3", "wav", "m4a", "aac"],
-                    key=f"music_{vi}"
-                )
-
-                music_path = None
-
-                if music_upload:
-                    music_path = WORK / (
-                        f"music_{vi}_"
-                        + re.sub(
-                            r"[^a-zA-Z0-9_.-]",
-                            "_",
-                            music_upload.name
-                        )
-                    )
-
-                    music_path.write_bytes(
-                        music_upload.getbuffer()
-                    )
-
-                music_volume = st.slider(
-                    "Volume musik",
-                    0.0, 1.0, 0.5, 0.1,
-                    key=f"volume_{vi}"
-                )
-
-                text_overlay = st.text_input(
-                    "Tulisan pada video (opsional)",
-                    placeholder="FULL THROTTLE! 🏁",
-                    key=f"text_{vi}"
-                )
-
-                st.caption(
-                    "Jika musik dipilih, musik akan "
-                    "menggantikan audio asli video."
-                )
-
-                st.divider()
-
-                if st.button(
-                    "🚀 RENDER FINAL VIDEO",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"render_{vi}"
-                ):
-
-                    valid = (
-                        len(edited) == len(made)
-                        and len(set(
-                            x["order"] for x in edited
-                        )) == len(edited)
-                        and all(
-                            x["end"] > x["start"]
-                            for x in edited
-                        )
-                    )
-
-                    if not valid:
-                        st.error(
-                            "Periksa durasi dan urutan klip."
-                        )
-
-                    else:
-                        folder = WORK / f"render_{vi}"
-                        folder.mkdir(exist_ok=True)
-
-                        rendered = []
-
-                        try:
-                            ordered = sorted(
-                                edited,
-                                key=lambda x: x["order"]
-                            )
-
-                            bar = st.progress(0)
-
-                            for n, clip in enumerate(
-                                ordered, 1
-                            ):
-
-                                dst = folder / (
-                                    f"Timeline_{n}.mp4"
-                                )
-
-                                subprocess.run(
-                                    [
-                                        ffmpeg_path(), "-y",
-                                        "-i", clip["path"],
-                                        "-ss", str(clip["start"]),
-                                        "-t", str(
-                                            clip["end"] -
-                                            clip["start"]
-                                        ),
-                                        "-map", "0:v:0",
-                                        "-map", "0:a?",
-                                        "-c:v", "libx264",
-                                        "-preset", "veryfast",
-                                        "-crf", "23",
-                                        "-pix_fmt", "yuv420p",
-                                        "-c:a", "aac",
-                                        "-b:a", "160k",
-                                        str(dst)
-                                    ],
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE,
-                                    check=True
-                                )
-
-                                rendered.append(dst)
-
-                                bar.progress(
-                                    n / len(ordered)
-                                )
-
-                            base = folder / "base.mp4"
-
-                            merge_clips(
-                                rendered,
-                                base
-                            )
-
-                            final = folder / (
-                                "EXOTIC_DRIVE_FINAL.mp4"
-                            )
-
-                            final_render(
-                                base,
-                                final,
-                                music=music_path,
-                                music_volume=music_volume,
-                                text_overlay=text_overlay,
-                                vertical=aspect.startswith("9:16")
-                            )
-
-                            st.session_state[
-                                f"final_{vi}"
-                            ] = str(final)
-
-                            st.success(
-                                "Video berhasil dirender!"
-                            )
-
-                        except Exception as e:
-                            st.error(
-                                f"Render gagal: {e}"
-                            )
-
-                final_path = st.session_state.get(
-                    f"final_{vi}"
-                )
-
-                if final_path and Path(final_path).exists():
-
-                    st.divider()
-                    st.header("🏆 5. HASIL AKHIR")
-
-                    st.video(final_path)
-
-                    with open(final_path, "rb") as f:
-                        video_bytes = f.read()
-
-                    st.download_button(
-                        "⬇️ DOWNLOAD FINAL VIDEO",
-                        data=video_bytes,
-                        file_name="EXOTIC_DRIVE_FINAL.mp4",
-                        mime="video/mp4",
-                        use_container_width=True,
-                        key=f"download_{vi}"
-                    )
-
-                    st.success(
-                        "Video siap diperiksa dan diupload!"
-                    )
-
-else:
-    st.info(
-        "Upload video, lalu tekan "
-        "ANALISIS & CARI HIGHLIGHT."
+    st.warning(
+        "Pilih file video dengan nama yang sama "
+        "dengan nama yang didaftarkan sebelumnya."
     )
 
-# ==========================================
-# FOOTER
-# ==========================================
+    upload_widget(
+        st.session_state["upload_url"]
+    )
+
+    st.caption(
+        "Jika upload berhasil, tekan tombol "
+        "Perbarui Daftar Video di bawah."
+    )
+
+
+# =====================================================
+# DRIVE VIDEO LIST
+# =====================================================
 
 st.divider()
 
-st.markdown("""
-<center>
-🏁 <b>EXOTIC DRIVE AI STUDIO</b><br>
-Free Video Editing • AI Auto Cut • Timeline Editor<br>
-<small>Built for Trophy Truck & Offroad Content</small>
-</center>
-""", unsafe_allow_html=True)
+st.subheader("2. Video di Google Drive")
+
+if st.button(
+    "🔄 Perbarui Daftar Video"
+):
+
+    st.session_state["refresh_files"] = True
+
+
+try:
+
+    videos = list_videos(
+        service,
+        folder_id
+    )
+
+except Exception as error:
+
+    st.error(str(error))
+    videos = []
+
+
+if not videos:
+
+    st.info(
+        "Belum ada video di folder upload."
+    )
+
+else:
+
+    options = {
+        f"{item['name']} | "
+        f"{int(item.get('size', 0)) / 1024 / 1024:.1f} MB":
+        item["id"]
+        for item in videos
+    }
+
+    selected_label = st.selectbox(
+        "Pilih video untuk Auto Cut",
+        list(options.keys())
+    )
+
+    selected_id = options[selected_label]
+
+    selected_file = next(
+        item for item in videos
+        if item["id"] == selected_id
+    )
+
+    size_mb = (
+        int(selected_file.get("size", 0))
+        / 1024 / 1024
+    )
+
+    st.write(
+        f"Ukuran video: {size_mb:.1f} MB"
+    )
+
+
+    # =================================================
+    # ANALYZE SELECTED VIDEO
+    # =================================================
+
+    if st.button(
+        "🔎 ANALISIS HOOK & HIGHLIGHT",
+        type="primary",
+        use_container_width=True
+    ):
+
+        try:
+
+            source = WORK / (
+                selected_id + "_" +
+                Path(selected_file["name"]).name
+            )
+
+            with st.spinner(
+                "Mengunduh video dari Google Drive..."
+            ):
+
+                download_drive_file(
+                    service,
+                    selected_id,
+                    source
+                )
+
+            with st.spinner(
+                "Menganalisis aktivitas video..."
+            ):
+
+                duration = probe_duration(source)
+
+                clips = analyze_video(
+                    source,
+                    duration,
+                    clip_seconds
+                )
+
+            st.session_state["analysis"] = {
+                "source": str(source),
+                "name": selected_file["name"],
+                "duration": duration,
+                "clips": clips
+            }
+
+            st.success(
+                "Analisis selesai!"
+            )
+
+        except Exception as error:
+
+            st.error(
+                "Gagal menganalisis video: "
+                + str(error)
+            )
+
+
+# =====================================================
+# RESULTS & RENDER
+# =====================================================
+
+analysis = st.session_state.get("analysis")
+
+if analysis:
+
+    st.divider()
+
+    st.subheader(
+        "3. Pilihan Hook dan Highlight"
+    )
+
+    st.write(
+        "Video: " + analysis["name"]
+    )
+
+    st.write(
+        "Caption: Big action. Big machines. "
+        "Pure off-road adrenaline!"
+    )
+
+    st.write(
+        "#ExoticDrive #TrophyTruck "
+        "#OffRoad #DesertRacing"
+    )
+
+    for index, clip in enumerate(
+        analysis["clips"]
+    ):
+
+        start = clip["start"]
+        end = clip["end"]
+
+        st.markdown(
+            f"**Highlight {index + 1}**"
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Skor aktivitas",
+            str(clip["score"]) + "/100"
+        )
+
+        col2.write(
+            f"{start:.1f}s – {end:.1f}s"
+        )
+
+        col3.write(
+            clip["reason"]
+        )
+
+        if st.button(
+            f"✂️ BUAT REELS {index + 1}",
+            key=f"render_{index}"
+        ):
+
+            destination = OUT / (
+                Path(analysis["name"]).stem
+                + f"_reel_{index + 1}.mp4"
+            )
+
+            try:
+
+                with st.spinner(
+                    "Membuat video vertikal 9:16..."
+                ):
+
+                    render_reel(
+                        analysis["source"],
+                        start,
+                        end,
+                        destination,
+                        add_watermark
+                    )
+
+                st.success(
+                    "Reels berhasil dibuat!"
+                )
+
+                st.video(
+                    str(destination)
+                )
+
+                with open(destination, "rb") as file:
+
+                    st.download_button(
+                        "⬇️ DOWNLOAD REELS",
+                        data=file,
+                        file_name=destination.name,
+                        mime="video/mp4",
+                        key=f"download_{index}"
+                    )
+
+            except Exception as error:
+
+                st.error(
+                    "Gagal membuat Reels: "
+                    + str(error)
+                )
+
+
+# =====================================================
+# FOOTER
+# =====================================================
+
+st.divider()
+
+st.caption(
+    "EXOTIC DRIVE AI | Google Drive Storage "
+    "| Free Motion Analysis | Vertical 9:16"
+)
+
+st.caption(
+    "Catatan: Skor aktivitas bukan prediksi viral. "
+    "Video 8K asli tidak dijamin; output saat ini "
+    "adalah 1080 × 1920."
+)
