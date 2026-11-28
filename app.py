@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import zipfile
 import requests
 import streamlit as st
 
@@ -1117,6 +1118,102 @@ if analysis:
         "tetapi gerakan kamera juga dapat memengaruhi nilai dan "
         "skor bukan jaminan viral."
     )
+
+    # Render semua highlight sekaligus dan kemas hasilnya ke ZIP.
+    st.markdown("### 🎬 Proses semua highlight sekaligus")
+    st.caption(
+        "Semua klip di bawah akan dibuat dalam format MP4 vertikal 9:16. "
+        "Setelah selesai, hasilnya bisa diunduh dalam satu file ZIP."
+    )
+
+    if st.button(
+        f"🎬 BUAT SEMUA REELS ({len(analysis['clips'])} KLIP)",
+        type="primary",
+        use_container_width=True,
+        key="render_all_reels"
+    ):
+        source_path = Path(analysis["source"])
+        if not source_path.exists():
+            st.error(
+                "File sumber tidak ditemukan di server. "
+                "Silakan jalankan analisis video kembali."
+            )
+        else:
+            created_files = []
+            failures = []
+            progress = st.progress(0)
+            status = st.empty()
+
+            for batch_index, batch_clip in enumerate(analysis["clips"]):
+                batch_destination = OUT / (
+                    Path(analysis["name"]).stem
+                    + f"_reel_{batch_index + 1}.mp4"
+                )
+                status.write(
+                    f"Membuat Reels {batch_index + 1} dari "
+                    f"{len(analysis['clips'])}..."
+                )
+                try:
+                    render_reel(
+                        source_path,
+                        batch_clip["start"],
+                        batch_clip["end"],
+                        batch_destination,
+                        add_watermark
+                    )
+                    created_files.append(batch_destination)
+                except Exception as batch_error:
+                    failures.append(
+                        f"Reels {batch_index + 1}: {batch_error}"
+                    )
+
+                progress.progress(
+                    (batch_index + 1) / len(analysis["clips"])
+                )
+
+            if created_files:
+                zip_path = OUT / (
+                    Path(analysis["name"]).stem + "_ALL_REELS.zip"
+                )
+                with zipfile.ZipFile(
+                    zip_path,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED
+                ) as archive:
+                    for video_path in created_files:
+                        archive.write(
+                            video_path,
+                            arcname=video_path.name
+                        )
+
+                st.session_state["all_reels_zip"] = str(zip_path)
+                st.success(
+                    f"Selesai! {len(created_files)} dari "
+                    f"{len(analysis['clips'])} Reels berhasil dibuat."
+                )
+                if failures:
+                    st.warning("Beberapa klip gagal dibuat:\n" + "\n".join(failures))
+            else:
+                st.error(
+                    "Tidak ada Reels yang berhasil dibuat. "
+                    + " | ".join(failures)
+                )
+
+    saved_zip = st.session_state.get("all_reels_zip")
+    if saved_zip and Path(saved_zip).exists():
+        zip_file = Path(saved_zip)
+        with open(zip_file, "rb") as zip_data:
+            st.download_button(
+                "⬇️ DOWNLOAD SEMUA REELS (ZIP)",
+                data=zip_data,
+                file_name=zip_file.name,
+                mime="application/zip",
+                key="download_all_reels_zip",
+                use_container_width=True
+            )
+
+    st.divider()
+    st.markdown("### Pilih dan buat Reels satu per satu")
 
     for index, clip in enumerate(
         analysis["clips"]
