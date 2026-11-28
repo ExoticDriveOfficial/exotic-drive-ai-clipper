@@ -109,6 +109,180 @@ def get_folder(service):
 
 
 # =====================================================
+# FACEBOOK PAGE CONNECTION & REELS PUBLISHING
+# =====================================================
+
+def get_facebook_config():
+    if "facebook" not in st.secrets:
+        raise RuntimeError(
+            "Facebook Secrets belum ditemukan."
+        )
+
+    config = st.secrets["facebook"]
+
+    page_id = str(config.get("page_id", "")).strip()
+    page_token = str(
+        config.get("page_access_token", "")
+    ).strip()
+    version = str(
+        config.get("graph_api_version", "v27.0")
+    ).strip()
+
+    if not page_id or not page_token:
+        raise RuntimeError(
+            "Page ID atau Page Access Token belum diatur."
+        )
+
+    return page_id, page_token, version
+
+
+def facebook_request_check(response, action):
+    try:
+        data = response.json()
+    except Exception:
+        raise RuntimeError(
+            action + ": respons Facebook tidak dapat dibaca."
+        )
+
+    if not response.ok or "error" in data:
+        error = data.get("error", {})
+        message = error.get(
+            "message",
+            response.text[:1000]
+        )
+        raise RuntimeError(
+            action + " gagal: " + str(message)
+        )
+
+    return data
+
+
+def test_facebook_connection():
+    page_id, token, version = get_facebook_config()
+
+    url = (
+        f"https://graph.facebook.com/"
+        f"{version}/{page_id}"
+    )
+
+    response = requests.get(
+        url,
+        params={
+            "fields": "id,name",
+            "access_token": token
+        },
+        timeout=30
+    )
+
+    return facebook_request_check(
+        response,
+        "Pemeriksaan Facebook"
+    )
+
+
+def publish_facebook_reel(video_path, caption):
+    page_id, token, version = get_facebook_config()
+
+    video_path = Path(video_path)
+
+    if not video_path.exists():
+        raise RuntimeError(
+            "File Reels tidak ditemukan."
+        )
+
+    file_size = video_path.stat().st_size
+
+    if file_size <= 0:
+        raise RuntimeError(
+            "File Reels kosong."
+        )
+
+    endpoint = (
+        f"https://graph.facebook.com/"
+        f"{version}/{page_id}/video_reels"
+    )
+
+    # TAHAP 1: Memulai sesi upload Reels
+    start_response = requests.post(
+        endpoint,
+        data={
+            "upload_phase": "START",
+            "access_token": token
+        },
+        timeout=60
+    )
+
+    start_data = facebook_request_check(
+        start_response,
+        "Memulai upload Reels"
+    )
+
+    video_id = start_data.get("video_id")
+    upload_url = start_data.get("upload_url")
+
+    if not video_id or not upload_url:
+        raise RuntimeError(
+            "Facebook tidak memberikan video_id "
+            "atau upload_url."
+        )
+
+    # TAHAP 2: Mengirim file video ke Facebook
+    headers = {
+        "Authorization": "OAuth " + token,
+        "offset": "0",
+        "file_size": str(file_size),
+        "Content-Type": "application/octet-stream"
+    }
+
+    with open(video_path, "rb") as video_file:
+        upload_response = requests.post(
+            upload_url,
+            headers=headers,
+            data=video_file,
+            timeout=(60, 900)
+        )
+
+    upload_data = facebook_request_check(
+        upload_response,
+        "Mengunggah file video"
+    )
+
+    if upload_data.get("success") is False:
+        raise RuntimeError(
+            "Facebook menolak file video."
+        )
+
+    # TAHAP 3: Menyelesaikan upload dan menerbitkan Reel
+    finish_response = requests.post(
+        endpoint,
+        data={
+            "upload_phase": "FINISH",
+            "video_id": video_id,
+            "video_state": "PUBLISHED",
+            "description": caption,
+            "access_token": token
+        },
+        timeout=120
+    )
+
+    finish_data = facebook_request_check(
+        finish_response,
+        "Menerbitkan Reels"
+    )
+
+    if finish_data.get("success") is not True:
+        raise RuntimeError(
+            "Facebook belum mengonfirmasi publikasi. "
+            + str(finish_data)
+        )
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "post_id": finish_data.get("post_id")
+    }
+
+# =====================================================
 # CREATE RESUMABLE UPLOAD SESSION
 # =====================================================
 
