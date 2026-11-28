@@ -466,6 +466,8 @@ def analyze_video(video, duration, clip_seconds=20):
 
     try:
 
+        # Ambil satu frame per detik pada resolusi kecil agar
+        # analisis gratis tetap relatif ringan untuk server.
         run_command([
             "ffmpeg",
             "-y",
@@ -485,7 +487,11 @@ def analyze_video(video, duration, clip_seconds=20):
                 "Frame video tidak dapat dibaca."
             )
 
-        scores = []
+        # Ukur dua hal:
+        # 1) Rata-rata perubahan piksel.
+        # 2) Persentase area gambar yang berubah cukup jelas.
+        # Gabungan ini menjadi indikator aktivitas visual.
+        motion_values = []
         previous = None
 
         for frame in files:
@@ -493,19 +499,33 @@ def analyze_video(video, duration, clip_seconds=20):
             image = Image.open(frame).convert("L")
 
             if previous is None:
-                score = 0
+                motion = 0.0
             else:
                 difference = ImageChops.difference(
                     previous,
                     image
                 )
 
-                score = (
-                    sum(ImageStat.Stat(difference).mean)
-                    / 255
+                mean_change = (
+                    ImageStat.Stat(difference).mean[0] / 255.0
                 )
 
-            scores.append(score)
+                changed = difference.point(
+                    lambda pixel: 255 if pixel >= 20 else 0
+                )
+
+                histogram = changed.histogram()
+                total_pixels = max(1, image.width * image.height)
+                changed_ratio = (
+                    sum(histogram[1:]) / total_pixels
+                )
+
+                motion = (
+                    0.70 * mean_change
+                    + 0.30 * changed_ratio
+                )
+
+            motion_values.append(motion)
             previous = image
 
         length = max(
@@ -523,90 +543,108 @@ def analyze_video(video, duration, clip_seconds=20):
             int(duration) - length
         )
 
+        step = max(1, length // 4)
+
         for start in range(
             0,
             max_start + 1,
-            max(1, length // 4)
+            step
         ):
 
-            end = min(
-                len(scores),
+            end_index = min(
+                len(motion_values),
                 start + length
             )
 
-            values = scores[
-                max(1, start + 1):end
+            values = motion_values[
+                max(1, start + 1):end_index
             ]
 
             if not values:
                 continue
 
-            average = sum(values) / len(values)
-            peak = max(values)
+            average_motion = sum(values) / len(values)
+            peak_motion = max(values)
 
-            total = (
-                0.75 * average
-                + 0.25 * peak
+            # Nilai gabungan memberi bobot lebih besar pada
+            # gerakan yang konsisten, dengan bonus untuk momen puncak.
+            activity = (
+                0.80 * average_motion
+                + 0.20 * peak_motion
             )
 
-            candidates.append((
-                total,
-                start,
-                min(duration, start + length)
-            ))
+            candidates.append({
+                "activity": activity,
+                "average_motion": average_motion,
+                "peak_motion": peak_motion,
+                "start": float(start),
+                "end": float(min(duration, start + length))
+            })
 
-        candidates.sort(reverse=True)
+        candidates.sort(
+            key=lambda item: item["activity"],
+            reverse=True
+        )
 
         selected = []
 
-        for score, start, end in candidates:
+        for candidate in candidates:
 
+            start_time = candidate["start"]
+            end_time = candidate["end"]
+
+            # Hindari klip-klip yang saling tumpang tindih.
             if all(
-                end <= item[1]
-                or start >= item[2]
+                end_time <= item["start"]
+                or start_time >= item["end"]
                 for item in selected
             ):
+                selected.append(candidate)
 
-                selected.append((
-                    score,
-                    start,
-                    end
-                ))
+            # Tidak ada batas 3 klip: tampilkan semua kandidat
+            # yang tidak saling tumpang tindih.
 
-            if len(selected) >= 3:
-                break
+        results = []
 
-        # Tetap urutkan klip berdasarkan aktivitas tertinggi.
-        # Skor adalah persentil relatif terhadap jendela video ini,
-        # bukan peluang viral atau ukuran aktivitas absolut.
-        selected_results = []
+        for item in selected:
 
-        total_candidates = max(1, len(candidates))
-
-        for rank, (raw_score, start, end) in enumerate(selected):
+            # Skor absolut berbasis intensitas perubahan visual,
+            # bukan angka peringkat buatan seperti 100, 96, 92.
+            # Skor tetap indikator visual, bukan pengenal aksi/viral.
             activity_score = round(
-                100 * (1 - (rank / total_candidates))
+                100 * (
+                    1 - math.exp(-5 * item["activity"])
+                )
             )
-            activity_score = max(1, min(100, activity_score))
 
-            selected_results.append({
-                "start": float(start),
-                "end": float(end),
+            activity_score = max(
+                0,
+                min(100, activity_score)
+            )
+
+            results.append({
+                "start": item["start"],
+                "end": item["end"],
                 "score": activity_score,
+                "average_motion": round(
+                    item["average_motion"], 4
+                ),
+                "peak_motion": round(
+                    item["peak_motion"], 4
+                ),
                 "reason": (
-                    "Peringkat aktivitas visual tinggi dibandingkan "
-                    "bagian lain dalam video yang sama."
+                    "Skor dihitung dari rata-rata perubahan visual "
+                    "dan puncak gerakan pada klip ini."
                 )
             })
 
-        return selected_results
+        return results
 
     finally:
         shutil.rmtree(
             temp,
             ignore_errors=True
         )
-
 
 
 # =====================================================
@@ -1067,10 +1105,17 @@ if analysis:
         "Video: " + analysis["name"]
     )
 
+    st.success(
+        f"Semua hasil highlight ditampilkan: "
+        f"{len(analysis['clips'])} klip. "
+        "Daftar diurutkan dari Activity Score tertinggi."
+    )
+
     st.info(
-        "Activity Score menunjukkan peringkat aktivitas visual "
-        "relatif di dalam video ini. Skor tinggi membantu memilih "
-        "bagian paling aktif, tetapi bukan jaminan viral."
+        "Activity Score dihitung dari perubahan piksel dan area gambar "
+        "yang berubah. Skor membantu membandingkan intensitas visual, "
+        "tetapi gerakan kamera juga dapat memengaruhi nilai dan "
+        "skor bukan jaminan viral."
     )
 
     for index, clip in enumerate(
@@ -1087,8 +1132,15 @@ if analysis:
         col1, col2, col3 = st.columns(3)
 
         col1.metric(
-            "Activity Score (relatif)",
+            "Activity Score (0–100)",
             str(clip["score"]) + "/100"
+        )
+
+        st.caption(
+            "Rata-rata gerakan visual: "
+            + str(clip.get("average_motion", 0))
+            + " | Puncak: "
+            + str(clip.get("peak_motion", 0))
         )
 
         col2.write(
@@ -1171,7 +1223,7 @@ st.caption(
 )
 
 st.caption(
-    "Catatan: Activity Score adalah peringkat relatif, bukan prediksi viral. "
+    "Catatan: Activity Score mengukur perubahan visual, bukan prediksi viral. "
     "Video 8K asli tidak dijamin; output saat ini "
     "adalah 1080 × 1920."
 )
