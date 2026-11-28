@@ -1039,6 +1039,33 @@ except Exception as error:
 
 
 # =====================================================
+# FACEBOOK CONNECTION TEST
+# =====================================================
+
+st.divider()
+st.subheader("📘 Koneksi Facebook Exotic Drive")
+
+if st.button(
+    "🔍 TEST KONEKSI FACEBOOK",
+    use_container_width=True
+):
+    try:
+        with st.spinner("Memeriksa koneksi Facebook..."):
+            page_info = test_facebook_connection()
+
+        st.success(
+            "KONEKSI FACEBOOK BERHASIL!"
+        )
+
+        st.write("Nama Page:", page_info.get("name"))
+        st.write("Page ID:", page_info.get("id"))
+
+    except Exception as error:
+        st.error(
+            "Koneksi Facebook gagal: " + str(error)
+        )
+
+# =====================================================
 # SIDEBAR
 # =====================================================
 
