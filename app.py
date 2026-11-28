@@ -1386,19 +1386,29 @@ if analysis:
                 use_container_width=True
             )
 
+    
     st.divider()
     st.markdown("### Pilih dan buat Reels satu per satu")
 
-    for index, clip in enumerate(
-        analysis["clips"]
-    ):
+    for index, clip in enumerate(analysis["clips"]):
 
         start = clip["start"]
         end = clip["end"]
 
-        st.markdown(
-            f"**Highlight {index + 1}**"
+        destination = OUT / (
+            Path(analysis["name"]).stem
+            + f"_reel_{index + 1}.mp4"
         )
+
+        caption_key = f"caption_{index}"
+        approval_key = f"approve_facebook_{index}"
+        published_key = (
+            "facebook_published_"
+            + Path(analysis["name"]).stem
+            + f"_{index + 1}"
+        )
+
+        st.markdown(f"**Highlight {index + 1}**")
 
         col1, col2, col3 = st.columns(3)
 
@@ -1407,6 +1417,10 @@ if analysis:
             str(clip["score"]) + "/100"
         )
 
+        col2.write(f"{start:.1f}s – {end:.1f}s")
+
+        col3.write(clip["reason"])
+
         st.caption(
             "Rata-rata gerakan visual: "
             + str(clip.get("average_motion", 0))
@@ -1414,22 +1428,20 @@ if analysis:
             + str(clip.get("peak_motion", 0))
         )
 
-        col2.write(
-            f"{start:.1f}s – {end:.1f}s"
-        )
+        st.markdown("**Caption Reels Facebook**")
 
-        col3.write(
-            clip["reason"]
-        )
-
-        st.markdown("**Caption unik untuk Reels ini**")
-        st.text_area(
-            "Caption siap salin",
-            value=clip.get("caption", make_reel_caption(
-                index, clip["score"], analysis["name"]
-            )),
+        caption_value = st.text_area(
+            "Edit caption sebelum publikasi",
+            value=clip.get(
+                "caption",
+                make_reel_caption(
+                    index,
+                    clip["score"],
+                    analysis["name"]
+                )
+            ),
             height=125,
-            key=f"caption_{index}"
+            key=caption_key
         )
 
         if st.button(
@@ -1437,17 +1449,10 @@ if analysis:
             key=f"render_{index}"
         ):
 
-            destination = OUT / (
-                Path(analysis["name"]).stem
-                + f"_reel_{index + 1}.mp4"
-            )
-
             try:
-
                 with st.spinner(
                     "Membuat video vertikal 9:16..."
                 ):
-
                     render_reel(
                         analysis["source"],
                         start,
@@ -1456,31 +1461,100 @@ if analysis:
                         add_watermark
                     )
 
-                st.success(
-                    "Reels berhasil dibuat!"
-                )
-
-                st.video(
-                    str(destination)
-                )
-
-                with open(destination, "rb") as file:
-
-                    st.download_button(
-                        "⬇️ DOWNLOAD REELS",
-                        data=file,
-                        file_name=destination.name,
-                        mime="video/mp4",
-                        key=f"download_{index}"
-                    )
+                st.success("Reels berhasil dibuat!")
 
             except Exception as error:
-
                 st.error(
-                    "Gagal membuat Reels: "
-                    + str(error)
+                    "Gagal membuat Reels: " + str(error)
                 )
 
+        # Tampilkan preview jika file sudah tersedia.
+        if destination.exists():
+
+            st.video(str(destination))
+
+            with open(destination, "rb") as video_file:
+                st.download_button(
+                    "⬇️ DOWNLOAD REELS",
+                    data=video_file,
+                    file_name=destination.name,
+                    mime="video/mp4",
+                    key=f"download_{index}"
+                )
+
+            st.divider()
+            st.markdown("**Publikasikan ke Facebook Page Exotic Drive**")
+
+            # Tampilkan status publikasi jika sudah berhasil.
+            if st.session_state.get(published_key):
+
+                publish_result = st.session_state[published_key]
+
+                st.success(
+                    "Reels ini sudah berhasil dikirim ke Facebook!"
+                )
+
+                st.write(
+                    "Facebook Video ID: "
+                    + str(publish_result.get("video_id", "-"))
+                )
+
+            else:
+
+                st.warning(
+                    "Periksa video dan caption terlebih dahulu. "
+                    "Publikasi hanya dilakukan setelah Anda menyetujui."
+                )
+
+                st.checkbox(
+                    "Saya sudah memeriksa video dan caption, "
+                    "serta menyetujui publikasi ke Facebook Exotic Drive.",
+                    key=approval_key
+                )
+
+                if st.button(
+                    f"🚀 SETUJUI & PUBLISH REELS {index + 1}",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"publish_facebook_{index}",
+                    disabled=not st.session_state.get(approval_key, False)
+                ):
+
+                    try:
+                        with st.spinner(
+                            "Mengirim Reels ke Facebook. "
+                            "Mohon jangan tutup dashboard..."
+                        ):
+
+                            result = publish_facebook_reel(
+                                destination,
+                                caption_value
+                            )
+
+                        st.session_state[published_key] = result
+
+                        st.success(
+                            "BERHASIL! Reels sudah diterbitkan "
+                            "ke Facebook Page Exotic Drive."
+                        )
+
+                        st.write(
+                            "Facebook Video ID: "
+                            + str(result.get("video_id", "-"))
+                        )
+
+                    except Exception as error:
+
+                        st.error(
+                            "Publikasi gagal: " + str(error)
+                        )
+
+        else:
+
+            st.info(
+                "Buat Reels terlebih dahulu agar preview "
+                "dan tombol publikasi tersedia."
+            )
 
 # =====================================================
 # FOOTER
